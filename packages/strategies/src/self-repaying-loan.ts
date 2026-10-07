@@ -54,6 +54,8 @@ export interface AmortizeStepParams {
 export interface CloseLoanParams {
   readonly state: SelfRepayingLoanState;
   readonly collateralPrice?: Decimal | undefined;
+  /** Cash the borrower brings to cover a debt the deployed yield cannot repay. */
+  readonly additionalRepayment?: Decimal | undefined;
 }
 
 export interface StrategyStepResult {
@@ -75,11 +77,8 @@ export class SelfRepayingLoanStrategy {
   readonly config: SelfRepayingLoanConfig;
   readonly liquidationModel: LiquidationParameterModel;
 
-  constructor(config: SelfRepayingLoanConfig | RawSelfRepayingLoanConfig) {
-    this.config =
-      "collateralAsset" in config && typeof config.collateralAsset === "string"
-        ? parseSelfRepayingLoanConfig(config as RawSelfRepayingLoanConfig)
-        : (config as SelfRepayingLoanConfig);
+  constructor(config: RawSelfRepayingLoanConfig) {
+    this.config = parseSelfRepayingLoanConfig(config);
 
     this.liquidationModel = new LiquidationParameterModel(
       this.config.openingLoanToValue,
@@ -95,7 +94,9 @@ export class SelfRepayingLoanStrategy {
    */
   open(params: OpenLoanParams): StrategyStepResult {
     if (params.collateralAmount.lte(Decimal.zero())) {
-      throw new RangeError("Collateral amount must be strictly positive to open a loan");
+      throw new RangeError(
+        "Collateral amount must be strictly positive to open a loan"
+      );
     }
     if (params.collateralPrice.lte(Decimal.zero())) {
       throw new RangeError("Collateral price must be strictly positive");
@@ -111,7 +112,9 @@ export class SelfRepayingLoanStrategy {
     const borrowAmount = maxBorrowValue.div(borrowPrice);
 
     if (borrowAmount.isZero()) {
-      throw new RangeError("Borrow amount calculated to zero from given collateral");
+      throw new RangeError(
+        "Borrow amount calculated to zero from given collateral"
+      );
     }
 
     const orders: StrategyOrder[] = [
@@ -166,6 +169,20 @@ export class SelfRepayingLoanStrategy {
     const currentPrice = params.collateralPrice ?? params.state.collateralPrice;
     const interestRate = params.borrowInterestRatePeriod ?? Decimal.zero();
 
+    if (currentPrice.lte(Decimal.zero())) {
+      throw new RangeError("Collateral price must be strictly positive");
+    }
+    if (interestRate.isNegative()) {
+      throw new RangeError(
+        `Borrow interest rate cannot be negative, got ${interestRate.toString()}`
+      );
+    }
+    if (params.yieldAccrued.isNegative()) {
+      throw new RangeError(
+        `Yield accrued cannot be negative, got ${params.yieldAccrued.toString()}`
+      );
+    }
+
     // 1. Accrue borrow interest on current debt
     const interestAccrued = params.state.debtAmount.mul(interestRate);
     const debtWithInterest = params.state.debtAmount.add(interestAccrued);
@@ -173,7 +190,10 @@ export class SelfRepayingLoanStrategy {
     let repayAmount = Decimal.zero();
     let remainingDebt = debtWithInterest;
 
-    if (params.yieldAccrued.gt(Decimal.zero()) && debtWithInterest.gt(Decimal.zero())) {
+    if (
+      params.yieldAccrued.gt(Decimal.zero()) &&
+      debtWithInterest.gt(Decimal.zero())
+    ) {
       if (params.yieldAccrued.gte(debtWithInterest)) {
         repayAmount = debtWithInterest;
         remainingDebt = Decimal.zero();
@@ -202,7 +222,8 @@ export class SelfRepayingLoanStrategy {
       collateralPrice: currentPrice,
       debtAmount: remainingDebt,
       totalYieldAmortized: params.state.totalYieldAmortized.add(repayAmount),
-      totalInterestAccrued: params.state.totalInterestAccrued.add(interestAccrued),
+      totalInterestAccrued:
+        params.state.totalInterestAccrued.add(interestAccrued),
     };
 
     return { nextState, orders };
@@ -213,10 +234,26 @@ export class SelfRepayingLoanStrategy {
    * 1. Unwinds deployed yield position (`withdraw_yield`).
    * 2. Repays any residual debt balance (`repay_debt`).
    * 3. Withdraws supplied collateral (`withdraw_collateral`).
+   *
+   * Throws when the deployed principal plus any `additionalRepayment` cannot
+   * cover the outstanding debt.
    */
   close(params: CloseLoanParams): StrategyStepResult {
     if (!params.state.isOpen || params.state.isClosed) {
       throw new Error("Cannot close an uninitialized or already closed loan");
+    }
+
+    const additionalRepayment = params.additionalRepayment ?? Decimal.zero();
+    if (additionalRepayment.isNegative()) {
+      throw new RangeError("Additional repayment cannot be negative");
+    }
+
+    const repayableFunds =
+      params.state.yieldDeployedPrincipal.add(additionalRepayment);
+    if (repayableFunds.lt(params.state.debtAmount)) {
+      throw new RangeError(
+        `Cannot close: debt ${params.state.debtAmount.toString()} exceeds repayable funds ${repayableFunds.toString()} by ${params.state.debtAmount.sub(repayableFunds).toString()}`
+      );
     }
 
     const orders: StrategyOrder[] = [];
@@ -264,11 +301,14 @@ export class SelfRepayingLoanStrategy {
   /**
    * Computes current Loan-to-Value (LTV) for a given loan state:
    * LTV = (Debt * BorrowPrice) / (Collateral * CollateralPrice)
+   *
+   * Returns `undefined` when collateral value is zero while debt remains, since
+   * no finite ratio describes that state.
    */
-  computeCurrentLtv(state: SelfRepayingLoanState): Decimal {
+  computeCurrentLtv(state: SelfRepayingLoanState): Decimal | undefined {
     const collateralVal = state.collateralAmount.mul(state.collateralPrice);
     if (collateralVal.isZero()) {
-      return state.debtAmount.isZero() ? Decimal.zero() : Decimal.one();
+      return state.debtAmount.isZero() ? Decimal.zero() : undefined;
     }
     const debtVal = state.debtAmount.mul(state.borrowAssetPrice);
     return debtVal.div(collateralVal);
