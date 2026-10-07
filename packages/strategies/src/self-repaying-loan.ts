@@ -4,7 +4,7 @@ import {
   parseSelfRepayingLoanConfig,
   type RawSelfRepayingLoanConfig,
 } from "./config";
-import { LiquidationParameterModel } from "./liquidation";
+import { LiquidationParameterModel } from "./models/liquidation-parameter";
 
 export type StrategyOrderType =
   | "supply_collateral"
@@ -81,11 +81,11 @@ export class SelfRepayingLoanStrategy {
         ? parseSelfRepayingLoanConfig(config as RawSelfRepayingLoanConfig)
         : (config as SelfRepayingLoanConfig);
 
-    this.liquidationModel = new LiquidationParameterModel({
-      maxLoanToValue: this.config.openingLoanToValue,
-      liquidationThreshold: this.config.liquidationThreshold,
-      liquidationPenalty: this.config.liquidationPenalty,
-    });
+    this.liquidationModel = new LiquidationParameterModel(
+      this.config.openingLoanToValue,
+      this.config.liquidationThreshold,
+      this.config.liquidationPenalty
+    );
   }
 
   /**
