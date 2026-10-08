@@ -1,18 +1,18 @@
-import { describe, expect, it } from "vitest";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { Decimal } from "./decimal";
+import { describe, expect, it } from "vitest";
+
 import type { RawSelfRepayingLoanConfig } from "./config";
+import { Decimal } from "./decimal";
 import {
   SelfRepayingLoanStrategy,
   type SelfRepayingLoanState,
   type StrategyOrder,
 } from "./self-repaying-loan";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const currentDir = path.dirname(fileURLToPath(import.meta.url));
 
 interface RunSnapshot {
   readonly step: number;
@@ -24,7 +24,7 @@ interface RunSnapshot {
     readonly yieldDeployedPrincipal: string;
     readonly totalYieldAmortized: string;
     readonly totalInterestAccrued: string;
-    readonly currentLtv: string;
+    readonly currentLtv: string | null;
     readonly healthFactor: string | null;
     readonly isOpen: boolean;
     readonly isClosed: boolean;
@@ -42,25 +42,19 @@ function runScenario(): RunSnapshot[] {
     collateralAsset: "XLM",
     borrowAsset: "USDC",
     yieldSource: "blend-pool",
-    openingLoanToValue: Decimal.from("0.50"),
-    deleverageBuffer: Decimal.from("0.05"),
-    deleverageTargetLtv: Decimal.from("0.55"),
-    liquidationThreshold: Decimal.from("0.75"),
-    liquidationPenalty: Decimal.from("0.08"),
+    openingLoanToValue: Decimal.fromString("0.50"),
+    deleverageBuffer: Decimal.fromString("0.05"),
+    deleverageTargetLtv: Decimal.fromString("0.55"),
+    liquidationThreshold: Decimal.fromString("0.75"),
+    liquidationPenalty: Decimal.fromString("0.08"),
     borrowRate: {
       mode: "fixed",
-      fixedRate: Decimal.from("0.05"),
+      fixedRate: Decimal.fromString("0.05"),
     },
   };
 
   const strategy = new SelfRepayingLoanStrategy(baseConfig);
   const snapshots: RunSnapshot[] = [];
-
-  // Step 0: Open
-  const openRes = strategy.open({
-    collateralAmount: Decimal.from("10000"),
-    collateralPrice: Decimal.from("0.20"),
-  });
 
   const recordSnapshot = (
     step: number,
@@ -68,9 +62,6 @@ function runScenario(): RunSnapshot[] {
     state: SelfRepayingLoanState,
     orders: readonly StrategyOrder[]
   ) => {
-    const ltv = strategy.computeCurrentLtv(state);
-    const hf = strategy.computeHealthFactor(state);
-
     snapshots.push({
       step,
       type,
@@ -81,8 +72,8 @@ function runScenario(): RunSnapshot[] {
         yieldDeployedPrincipal: state.yieldDeployedPrincipal.toString(),
         totalYieldAmortized: state.totalYieldAmortized.toString(),
         totalInterestAccrued: state.totalInterestAccrued.toString(),
-        currentLtv: ltv.toString(),
-        healthFactor: hf ? hf.toString() : null,
+        currentLtv: strategy.computeCurrentLtv(state)?.toString() ?? null,
+        healthFactor: strategy.computeHealthFactor(state)?.toString() ?? null,
         isOpen: state.isOpen,
         isClosed: state.isClosed,
       },
@@ -95,10 +86,14 @@ function runScenario(): RunSnapshot[] {
     });
   };
 
+  // Step 0: open 10,000 XLM at $0.20 for a $1,000 USDC borrow at 50% LTV.
+  const openRes = strategy.open({
+    collateralAmount: Decimal.fromString("10000"),
+    collateralPrice: Decimal.fromString("0.20"),
+  });
   recordSnapshot(0, "open", openRes.nextState, openRes.orders);
 
-  // Amortization schedule steps
-  const yieldAccruals = [
+  const schedule = [
     { yield: "150", interest: "0.01", price: "0.20" },
     { yield: "200", interest: "0.01", price: "0.21" },
     { yield: "250", interest: "0.01", price: "0.22" },
@@ -107,25 +102,23 @@ function runScenario(): RunSnapshot[] {
   ];
 
   let currentState = openRes.nextState;
-  for (let i = 0; i < yieldAccruals.length; i++) {
-    const entry = yieldAccruals[i]!;
+  for (const [i, entry] of schedule.entries()) {
     const amortizeRes = strategy.amortize({
       state: currentState,
-      yieldAccrued: Decimal.from(entry.yield),
-      borrowInterestRatePeriod: Decimal.from(entry.interest),
-      collateralPrice: Decimal.from(entry.price),
+      yieldAccrued: Decimal.fromString(entry.yield),
+      borrowInterestRatePeriod: Decimal.fromString(entry.interest),
+      collateralPrice: Decimal.fromString(entry.price),
     });
     currentState = amortizeRes.nextState;
     recordSnapshot(i + 1, "amortize", currentState, amortizeRes.orders);
   }
 
-  // Final step: Close
   const closeRes = strategy.close({
     state: currentState,
-    collateralPrice: Decimal.from("0.25"),
+    collateralPrice: Decimal.fromString("0.25"),
   });
   recordSnapshot(
-    yieldAccruals.length + 1,
+    schedule.length + 1,
     "close",
     closeRes.nextState,
     closeRes.orders
@@ -136,15 +129,20 @@ function runScenario(): RunSnapshot[] {
 
 describe("Golden Scenario Determinism", () => {
   const goldenFilePath = path.join(
-    __dirname,
+    currentDir,
     "../test-fixtures/scenario-golden.json"
   );
 
-  it("pins full scenario run snapshot sequence against golden fixture", () => {
+  it("matches the recorded snapshot sequence for a fixed scenario", () => {
     const actualSnapshots = runScenario();
 
-    // If UPDATE_GOLDEN=true is explicitly set in env, update the file
     if (process.env.UPDATE_GOLDEN === "true") {
+      if (process.env.CI) {
+        throw new Error(
+          "Refusing to regenerate the golden fixture under CI. Run UPDATE_GOLDEN=true locally and review the diff before committing it."
+        );
+      }
+
       fs.mkdirSync(path.dirname(goldenFilePath), { recursive: true });
       fs.writeFileSync(
         goldenFilePath,
@@ -158,8 +156,9 @@ describe("Golden Scenario Determinism", () => {
       `Golden fixture file missing at ${goldenFilePath}. To generate intentionally, run UPDATE_GOLDEN=true pnpm test.`
     ).toBe(true);
 
-    const expectedContent = fs.readFileSync(goldenFilePath, "utf-8");
-    const expectedSnapshots = JSON.parse(expectedContent);
+    const expectedSnapshots = JSON.parse(
+      fs.readFileSync(goldenFilePath, "utf-8")
+    ) as RunSnapshot[];
 
     expect(actualSnapshots).toEqual(expectedSnapshots);
   });
