@@ -1,25 +1,55 @@
 # @meridian/strategies
 
-Strategy execution engine, self-repaying loan models, and determinism verification for Meridian.
+Strategy engine and simulation library for Meridian.
 
-## Test Suites
+## Simulation boundary
 
-- **Unit tests**: `src/self-repaying-loan.spec.ts`
-- **Property-based invariant tests**: `src/accounting-invariants.spec.ts`
-  - Validates that the core accounting identity `InitialDebt + TotalInterest = RemainingDebt + TotalYieldAmortized` holds across randomized fill schedules.
-  - Validates that two runs using the same seed and scenario parameters produce bit-for-bit identical outputs and report history.
-- **Golden-file determinism suite**: `src/golden-scenario.spec.ts`
-  - Compares the complete execution snapshot trace of a reference scenario against `test-fixtures/scenario-golden.json`.
+The engine runs simulations. It may read market data over RPC, and it may not
+sign or submit a transaction, so an unlaunched strategy cannot reach real funds.
 
-### Regenerating Golden Files
+`assertSimulationOnly` and `guardStrategyAction` throw
+`StrategyIsolationViolationError` before any signing or submission call.
+`guard.test.ts` also scans the package's own sources and fails the suite if a
+signing or submission API, a deployed contract address, or the
+`CONTRACT_ADDRESSES` table appears in them.
 
-Regenerating the golden fixture file must always be a deliberate action when strategy mechanics or snapshot schemas are intentionally altered.
+Live execution stays off unless `MERIDIAN_STRATEGIES_LIVE_EXECUTION` is exactly
+`true`. That variable is the single place a launch flips the boundary, and any
+other value leaves the engine in simulation mode.
 
-To regenerate:
+## Fixed-point math
+
+Monetary values use `Decimal`, a fixed-point type backed by `bigint` that stores
+a value as `raw / 10^scale`. The default scale is 7, matching Stellar stroops.
+
+```ts
+import { Decimal } from "@meridian/strategies";
+
+const a = Decimal.fromString("100.25");
+const b = Decimal.fromStroops(500_000_000n); // 50.0000000
+a.add(b).toString(); // "150.2500000"
+```
+
+Rounding rules:
+
+- An operation aligns both operands to the wider of their two scales first, so
+  no operand is rounded before the operation runs. The result carries that
+  wider scale.
+- `add` and `sub` are exact. `mul` and `div` round once, at the result scale,
+  with the mode passed in (default `half-up`).
+- Comparisons compare aligned values exactly and are symmetric across scales.
+- `toStroops()` rescales to scale 7 and rounds `half-up`, so a value held at a
+  finer scale loses precision on conversion.
+
+A `bigint` operand is raw units at the receiver's scale. A `string` operand is
+a decimal literal, taken at its exact value.
+
+## Installation
+
 ```bash
-UPDATE_GOLDEN=true pnpm --filter @meridian/strategies test
+pnpm add @meridian/strategies
 ```
-Or on Windows PowerShell:
-```powershell
-$env:UPDATE_GOLDEN="true"; pnpm --filter @meridian/strategies test; $env:UPDATE_GOLDEN=""
-```
+
+## License
+
+MIT
